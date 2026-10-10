@@ -8,6 +8,8 @@
 """
 
 import argparse
+import csv
+import json
 import os
 import signal
 import sqlite3
@@ -31,6 +33,53 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 DB_FILE = os.path.join(DATA_DIR, "traffic_stats.db")
 REFRESH_INTERVAL = 1  # 刷新间隔（秒）
 MAX_HISTORY_DAYS = 90  # 保留最近 90 天的历史记录
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+
+DEFAULT_CONFIG = {
+    "daily_limit_gb": 0,
+    "monthly_limit_gb": 0,
+    "warning_threshold": 80,
+    "monitored_interface": "",
+}
+
+
+# ============================================================
+# 配置管理
+# ============================================================
+
+def load_config():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            merged = DEFAULT_CONFIG.copy()
+            merged.update(cfg)
+            return merged
+        except (json.JSONDecodeError, IOError):
+            pass
+    return DEFAULT_CONFIG.copy()
+
+
+def save_config(cfg):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
+def print_config(cfg):
+    print("=" * 60)
+    print("                    当前配置")
+    print("=" * 60)
+    daily = cfg.get("daily_limit_gb", 0)
+    monthly = cfg.get("monthly_limit_gb", 0)
+    threshold = cfg.get("warning_threshold", 80)
+    iface = cfg.get("monitored_interface", "")
+    print(f"  每日流量上限: {'无限制' if daily <= 0 else f'{daily} GB'}")
+    print(f"  每月流量上限: {'无限制' if monthly <= 0 else f'{monthly} GB'}")
+    print(f"  预警百分比:   {threshold}%")
+    print(f"  监控网卡:     {'全部' if not iface else iface}")
+    print("=" * 60)
 
 
 # ============================================================
@@ -137,7 +186,16 @@ def db_reset(conn):
 # 网络流量获取
 # ============================================================
 
-def get_network_io():
+def get_network_io(interface=None):
+    if interface:
+        counters = psutil.net_io_counters(pernic=True)
+        if interface in counters:
+            c = counters[interface]
+            return c.bytes_sent, c.bytes_recv
+        else:
+            available = ", ".join(sorted(counters.keys()))
+            print(f"错误：找不到网卡 '{interface}'。可用网卡: {available}")
+            sys.exit(1)
     counters = psutil.net_io_counters()
     return counters.bytes_sent, counters.bytes_recv
 
@@ -180,11 +238,15 @@ def format_speed(bytes_per_sec):
 class NetworkMonitor:
     """网络流量实时监控器（数据直写 SQLite）"""
 
-    def __init__(self, refresh_interval=REFRESH_INTERVAL):
+    def __init__(self, refresh_interval=REFRESH_INTERVAL, interface=None, config=None):
         self.running = True
         self.interval = refresh_interval
+        self.interface = interface
+        self.config = config or DEFAULT_CONFIG.copy()
         self.conn = init_db()
-        self.prev_sent, self.prev_recv = get_network_io()
+        self.prev_sent, self.prev_recv = get_network_io(interface)
+        self._alerted_daily = False
+        self._alerted_monthly = False
 
         signal.signal(signal.SIGINT, self._signal_handler)
         if hasattr(signal, "SIGTERM"):
@@ -206,9 +268,37 @@ class NetworkMonitor:
         sent, recv = db_query_one(self.conn, "daily", today_key)
         return {"sent": sent, "recv": recv}
 
+    def _check_alerts(self, today_stats):
+        threshold = self.config.get("warning_threshold", 80) / 100.0
+
+        daily_limit = self.config.get("daily_limit_gb", 0) * 1024 * 1024 * 1024
+        if daily_limit > 0:
+            today_total = today_stats["sent"] + today_stats["recv"]
+            if today_total >= daily_limit and not self._alerted_daily:
+                print(f"\n  [!!] 已达到每日流量上限 {format_bytes(daily_limit)}！")
+                self._alerted_daily = True
+            elif today_total >= daily_limit * threshold and not self._alerted_daily:
+                pct = today_total / daily_limit * 100
+                print(f"\n  [!!] 今日流量使用已达 {pct:.0f}%，接近上限 {format_bytes(daily_limit)}！")
+                self._alerted_daily = True
+
+        monthly_limit = self.config.get("monthly_limit_gb", 0) * 1024 * 1024 * 1024
+        if monthly_limit > 0:
+            month_key = get_monthly_key()
+            m_sent, m_recv = db_query_one(self.conn, "monthly", month_key)
+            month_total = m_sent + m_recv
+            if month_total >= monthly_limit and not self._alerted_monthly:
+                print(f"\n  [!!] 已达到本月流量上限 {format_bytes(monthly_limit)}！")
+                self._alerted_monthly = True
+            elif month_total >= monthly_limit * threshold and not self._alerted_monthly:
+                pct = month_total / monthly_limit * 100
+                print(f"\n  [!!] 本月流量使用已达 {pct:.0f}%，接近上限 {format_bytes(monthly_limit)}！")
+                self._alerted_monthly = True
+
     def run(self):
+        iface_info = f" (网卡: {self.interface})" if self.interface else ""
         print("=" * 60)
-        print("         网络流量监控器 (按 Ctrl+C 退出)")
+        print(f"         网络流量监控器{iface_info} (按 Ctrl+C 退出)")
         print("=" * 60)
         print(f"{'时间':<12} {'下载速度':>14} {'上传速度':>14} {'今日下载':>14} {'今日上传':>14}")
         print("-" * 60)
@@ -219,7 +309,7 @@ class NetworkMonitor:
             try:
                 time.sleep(self.interval)
 
-                current_sent, current_recv = get_network_io()
+                current_sent, current_recv = get_network_io(self.interface)
 
                 sent_delta = current_sent - self.prev_sent
                 recv_delta = current_recv - self.prev_recv
@@ -245,6 +335,8 @@ class NetworkMonitor:
                     end="",
                     flush=True,
                 )
+
+                self._check_alerts(today_stats)
 
                 self.prev_sent = current_sent
                 self.prev_recv = current_recv
@@ -345,8 +437,83 @@ def show_dashboard():
             f"{format_bytes(md['sent'] + md['recv']):>14}"
         )
 
+    # 今日小时统计
+    show_hourly_detail(conn, today_key)
+
     print("\n" + "=" * 60)
     conn.close()
+
+
+def show_hourly_detail(conn, today_key):
+    hourly_all = db_query_range(conn, "hourly")
+    today_hours = {k: v for k, v in hourly_all.items() if k.startswith(today_key)}
+    if not today_hours:
+        return
+    sorted_hours = sorted(today_hours.keys())
+    print(f"\n  今日各小时流量 ({today_key}):")
+    print(f"    {'小时':<8} {'下载':>12} {'上传':>12} {'合计':>12}")
+    print(f"    {'-' * 46}")
+    for h in sorted_hours:
+        s, r = today_hours[h]
+        hour_label = h[-2:] + ":00"
+        print(
+            f"    {hour_label:<8} "
+            f"{format_bytes(r):>12} "
+            f"{format_bytes(s):>12} "
+            f"{format_bytes(s + r):>12}"
+        )
+
+
+# ============================================================
+# 数据导出
+# ============================================================
+
+def export_data(fmt, output_file):
+    conn = init_db()
+    if not db_has_data(conn):
+        print("暂无统计数据可供导出。")
+        conn.close()
+        return
+
+    daily_all = db_query_range(conn, "daily")
+
+    records = []
+    for day_key, (s, r) in sorted(daily_all.items()):
+        records.append({
+            "date": day_key,
+            "sent_bytes": s,
+            "recv_bytes": r,
+            "total_bytes": s + r,
+            "sent": format_bytes(s),
+            "recv": format_bytes(r),
+            "total": format_bytes(s + r),
+        })
+
+    conn.close()
+
+    if fmt == "csv":
+        _export_csv(records, output_file)
+    elif fmt == "json":
+        _export_json(records, output_file)
+
+
+def _export_csv(records, output_file):
+    with open(output_file, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=["date", "sent_bytes", "recv_bytes", "total_bytes", "sent", "recv", "total"])
+        writer.writeheader()
+        writer.writerows(records)
+    print(f"数据已导出到: {output_file} ({len(records)} 条记录)")
+
+
+def _export_json(records, output_file):
+    summary = {
+        "export_time": datetime.now().isoformat(),
+        "total_records": len(records),
+        "daily_stats": records,
+    }
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    print(f"数据已导出到: {output_file} ({len(records)} 条记录)")
 
 
 def show_interfaces():
@@ -377,6 +544,8 @@ def show_interfaces():
 # ============================================================
 
 def main():
+    cfg = load_config()
+
     parser = argparse.ArgumentParser(
         description="网络流量监控与统计工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -385,8 +554,12 @@ def main():
   python network_monitor.py -h              查看帮助信息
   python network_monitor.py                 显示统计面板
   python network_monitor.py --monitor       启动实时监控
+  python network_monitor.py --monitor -I eth0   监控指定网卡
   python network_monitor.py --interfaces    查看网络接口信息
   python network_monitor.py --reset         重置统计数据
+  python network_monitor.py --config        查看/修改配置
+  python network_monitor.py --export csv -o report.csv  导出数据
+  python network_monitor.py --set-limit --daily 2 --monthly 50  设置流量上限
         """,
     )
     parser.add_argument(
@@ -400,9 +573,43 @@ def main():
         help="显示所有网络接口信息",
     )
     parser.add_argument(
+        "-I", "--interface",
+        type=str,
+        default=cfg.get("monitored_interface", ""),
+        help="指定监控的网卡名称（如 eth0, WLAN）",
+    )
+    parser.add_argument(
         "-r", "--reset",
         action="store_true",
         help="重置所有统计数据",
+    )
+    parser.add_argument(
+        "--config",
+        action="store_true",
+        help="查看当前配置",
+    )
+    parser.add_argument(
+        "--set-limit",
+        action="store_true",
+        help="设置流量配额上限",
+    )
+    parser.add_argument(
+        "--daily",
+        type=float,
+        default=0,
+        help="每日流量上限 (GB)，配合 --set-limit 使用",
+    )
+    parser.add_argument(
+        "--monthly",
+        type=float,
+        default=0,
+        help="每月流量上限 (GB)，配合 --set-limit 使用",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=int,
+        default=cfg.get("warning_threshold", 80),
+        help=f"预警百分比 (1-100)，默认 {cfg.get('warning_threshold', 80)}",
     )
     parser.add_argument(
         "--interval",
@@ -410,9 +617,48 @@ def main():
         default=REFRESH_INTERVAL,
         help=f"监控刷新间隔（秒），默认 {REFRESH_INTERVAL}",
     )
+    parser.add_argument(
+        "--export",
+        type=str,
+        choices=["csv", "json"],
+        help="导出统计数据为 CSV 或 JSON 格式",
+    )
+    parser.add_argument(
+        "-o", "--output-file",
+        type=str,
+        default="traffic_export",
+        help="导出文件路径（不含扩展名），默认 traffic_export",
+    )
 
     args = parser.parse_args()
 
+    # 查看配置
+    if args.config:
+        print_config(cfg)
+        return
+
+    # 设置流量上限
+    if args.set_limit:
+        if args.daily > 0:
+            cfg["daily_limit_gb"] = args.daily
+            print(f"每日流量上限已设置为 {args.daily} GB")
+        else:
+            cfg["daily_limit_gb"] = 0
+            print("每日流量上限已取消")
+        if args.monthly > 0:
+            cfg["monthly_limit_gb"] = args.monthly
+            print(f"每月流量上限已设置为 {args.monthly} GB")
+        else:
+            cfg["monthly_limit_gb"] = 0
+            print("每月流量上限已取消")
+        cfg["warning_threshold"] = args.threshold
+        if args.interface:
+            cfg["monitored_interface"] = args.interface
+        save_config(cfg)
+        print_config(cfg)
+        return
+
+    # 重置数据
     if args.reset:
         confirm = input("确认要重置所有统计数据吗？(y/N): ")
         if confirm.lower() == "y":
@@ -425,8 +671,23 @@ def main():
             print("操作已取消。")
         return
 
+    # 导出数据
+    if args.export:
+        fmt = args.export
+        ext = ".csv" if fmt == "csv" else ".json"
+        output_path = args.output_file
+        if not output_path.endswith(ext):
+            output_path += ext
+        export_data(fmt, output_path)
+        return
+
+    # 监控模式
     if args.monitor:
-        monitor = NetworkMonitor(refresh_interval=args.interval)
+        monitor = NetworkMonitor(
+            refresh_interval=args.interval,
+            interface=args.interface or None,
+            config=cfg,
+        )
         monitor.run()
     elif args.interfaces:
         show_interfaces()
