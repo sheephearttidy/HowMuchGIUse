@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 网络流量监控与统计脚本
 功能：
@@ -383,6 +382,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
+  python network_monitor.py -h              查看帮助信息
   python network_monitor.py                 显示统计面板
   python network_monitor.py --monitor       启动实时监控
   python network_monitor.py --interfaces    查看网络接口信息
